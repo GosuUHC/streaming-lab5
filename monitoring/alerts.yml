@@ -1,0 +1,38 @@
+groups:
+  - name: streaming-alerts
+    rules:
+      - alert: HighProcessingLatency
+        expr: flink_taskmanager_job_task_operator_currentEmitEventTimeLag > 10000
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High processing latency detected"
+          description: "Processing latency is {{ $value }} ms"
+
+      - alert: ModelServerDown
+        expr: up{job="model-server-metrics"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Model server is down"
+          description: "The ML model server is not responding"
+
+      - alert: HighPredictionLatency
+        expr: model_prediction_latency_seconds{quantile="0.99"} > 0.03
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High prediction latency detected"
+          description: "p99 prediction latency is {{ $value }} seconds"
+
+      - alert: HighPredictionErrors
+        expr: rate(model_prediction_errors_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High prediction error rate"
+          description: "Prediction error rate is {{ $value }}"
