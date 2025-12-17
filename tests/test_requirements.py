@@ -3,6 +3,7 @@ import requests
 import time
 import numpy as np
 import logging
+import random
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

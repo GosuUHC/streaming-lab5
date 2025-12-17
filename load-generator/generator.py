@@ -126,7 +126,7 @@ if __name__ == '__main__':
         generator = PatientDataGenerator()
         # Даем время другим сервисам запуститься
         time.sleep(10)
-        generator.start_normal_load(events_per_second=500)
+        generator.start_normal_load(events_per_second=50)
     except Exception as e:
         logger.error(f"Generator failed: {e}")
         raise

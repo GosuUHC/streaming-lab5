@@ -1,0 +1,6 @@
+kafka-python>=2.0.2,<3.0.0
+requests>=2.31.0,<3.0.0
+redis>=5.0.1,<6.0.0
+numpy>=1.24.3,<2.0.0
+apache-flink==1.19.0
+apache-flink-libraries==1.19.0

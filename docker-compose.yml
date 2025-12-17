@@ -1,5 +1,4 @@
 # docker-compose.yml
-version: "3.8"
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.3.0
@@ -14,32 +13,62 @@ services:
       KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_JMX_PORT: 9999
+      KAFKA_JMX_HOSTNAME: kafka
+      KAFKA_JMX_OPTS: -Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false -Dcom.sun.management.jmxremote.rmi.port=9999 -Djava.rmi.server.hostname=kafka
 
   jobmanager:
-    image: flink:1.15-scala_2.12
+    image: flink:1.19.0-scala_2.12
     ports:
       - "8081:8081"
-    command: jobmanager
+    expose:
+      - "9250"
+    command: >
+      sh -c "
+      cp /opt/flink/opt/flink-metrics-prometheus*.jar /opt/flink/lib/ 2>/dev/null || true &&
+      /docker-entrypoint.sh jobmanager
+      "
     environment:
       - |
         FLINK_PROPERTIES=
         jobmanager.rpc.address: jobmanager
+        metrics.reporters: prom
         metrics.reporter.prom.class: org.apache.flink.metrics.prometheus.PrometheusReporter
         metrics.reporter.prom.port: 9250
+        metrics.reporter.prom.host: 0.0.0.0
+        state.backend: filesystem
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        state.savepoints.dir: file:///opt/flink/savepoints
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+      - flink-savepoints:/opt/flink/savepoints
 
   taskmanager:
-    image: flink:1.15-scala_2.12
+    image: flink:1.19.0-scala_2.12
     depends_on:
       - jobmanager
-    command: taskmanager
+    expose:
+      - "9250"
+    command: >
+      sh -c "
+      cp /opt/flink/opt/flink-metrics-prometheus*.jar /opt/flink/lib/ 2>/dev/null || true &&
+      /docker-entrypoint.sh taskmanager
+      "
     scale: 2
     environment:
       - |
         FLINK_PROPERTIES=
         jobmanager.rpc.address: jobmanager
         taskmanager.numberOfTaskSlots: 4
+        metrics.reporters: prom
         metrics.reporter.prom.class: org.apache.flink.metrics.prometheus.PrometheusReporter
         metrics.reporter.prom.port: 9250
+        metrics.reporter.prom.host: 0.0.0.0
+        state.backend: filesystem
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+      - flink-savepoints:/opt/flink/savepoints
 
   redis:
     image: redis:6.2-alpine
@@ -53,12 +82,34 @@ services:
     depends_on:
       - redis
 
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    command:
+      - '--kafka.server=kafka:9092'
+      - '--web.listen-address=:9308'
+    ports:
+      - "9308:9308"
+    depends_on:
+      - kafka
+
+  pushgateway:
+    image: prom/pushgateway:latest
+    ports:
+      - "9091:9091"
+    command:
+      - '--persistence.file=/tmp/pushgateway.db'
+
   prometheus:
     image: prom/prometheus:latest
     ports:
       - "9090:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml
+      - ./monitoring/taskmanager_targets.json:/etc/prometheus/taskmanager_targets.json
+    depends_on:
+      - kafka-exporter
+      - pushgateway
 
   grafana:
     image: grafana/grafana:8.5.1
@@ -67,6 +118,7 @@ services:
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_INSTALL_PLUGINS=grafana-clock-panel
+      - GF_PATHS_PROVISIONING=/etc/grafana/provisioning
     volumes:
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
@@ -78,3 +130,52 @@ services:
     depends_on:
       - kafka
       - redis
+
+  data-drift-monitor:
+    build:
+      context: ./monitoring
+      dockerfile: Dockerfile
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - PROMETHEUS_GATEWAY=pushgateway:9091
+      - REFERENCE_DATA_PATH=/data/hospital_readmissions_30k.csv
+      - KAFKA_BOOTSTRAP=kafka:9092
+      - KAFKA_TOPIC=patient-readmissions
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      - redis
+      - pushgateway
+      - kafka
+    restart: unless-stopped
+
+  flink-job:
+    build: ./flink-jobs
+    depends_on:
+      - jobmanager
+      - taskmanager
+      - kafka
+      - model-server
+      - redis
+    environment:
+      - FLINK_JOB_MANAGER=jobmanager:8081
+      - KAFKA_BOOTSTRAP=kafka:9092
+      - MODEL_SERVER=http://model-server:8000
+      - REDIS_HOST=redis
+    command: >
+      sh -c "
+      echo 'Waiting for Flink JobManager to be ready...' &&
+      until nc -z jobmanager 8081; do sleep 2; done &&
+      echo 'Waiting for Kafka to be ready...' &&
+      until nc -z kafka 9092; do sleep 2; done &&
+      echo 'Waiting for Model Server to be ready...' &&
+      until nc -z model-server 8000; do sleep 2; done &&
+      echo 'Starting Flink Job...' &&
+      python3 /opt/flink/usrlib/patient_monitoring.py
+      "
+    restart: unless-stopped
+
+volumes:
+  flink-checkpoints:
+  flink-savepoints:

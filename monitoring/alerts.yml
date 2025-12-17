@@ -20,7 +20,7 @@ groups:
           description: "The ML model server is not responding"
 
       - alert: HighPredictionLatency
-        expr: model_prediction_latency_seconds{quantile="0.99"} > 0.03
+        expr: histogram_quantile(0.99, rate(model_prediction_latency_seconds_bucket[5m])) > 0.03
         for: 2m
         labels:
           severity: warning
@@ -36,3 +36,43 @@ groups:
         annotations:
           summary: "High prediction error rate"
           description: "Prediction error rate is {{ $value }}"
+
+  - name: kafka-alerts
+    rules:
+      - alert: HighKafkaLag
+        expr: kafka_consumergroup_lag_sum > 1000
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Высокий lag в Kafka"
+          description: "Lag для {{ $labels.consumergroup }} превысил 1000 сообщений"
+      
+      - alert: KafkaConsumerLag
+        expr: kafka_consumergroup_lag > 1000
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Высокий lag в Kafka"
+          description: "Lag для {{ $labels.consumergroup }} превысил 1000 сообщений"
+
+  - name: data-quality-alerts
+    rules:
+      - alert: DataDriftDetected
+        expr: data_drift_detected > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Обнаружен data drift"
+          description: "Data drift score: {{ $value }}"
+
+      - alert: HighLateDataRatio
+        expr: late_data_ratio > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Высокая доля late-arriving данных"
+          description: "Доля late данных: {{ $value | humanizePercentage }}"
