@@ -57,7 +57,6 @@ def test_latency():
         print(f"  p50: {p50:.2f} ms")
         print(f"  p95: {p95:.2f} ms")
         print(f"  p99: {p99:.2f} ms")
-        print(f"throughput {1000 / (sum(latencies) / 1000)}")
         print(f"  Samples: {len(latencies)}")
 
         # Проверка требования

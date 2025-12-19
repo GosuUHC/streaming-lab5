@@ -1,8 +1,9 @@
 import json
 import time
 import logging
-import requests
+import os
 import redis
+import numpy as np
 from datetime import datetime
 from typing import Optional, Dict
 
@@ -35,7 +36,8 @@ threading.excepthook = handle_thread_exception
 KAFKA_BROKERS = "kafka:9092"
 REDIS_HOST = "redis"
 REDIS_PORT = 6379
-MODEL_ENDPOINT = "http://model-server:8000/predict"
+MODEL_PATH = "/opt/flink/models/readmission_model.onnx"
+FEATURE_CONFIG_PATH = "/opt/flink/models/model_metadata.json"
 
 
 @udf(result_type=DataTypes.STRING())
@@ -49,8 +51,42 @@ def predict_patient_risk_json(
 ) -> str:
     """
     UDF для предсказания риска повторной госпитализации с измерением latency.
+    Использует ONNX модель напрямую для низкой задержки.
     """
     total_start = time.time()
+    
+    # Lazy init ONNX session
+    if not hasattr(predict_patient_risk_json, '_onnx_session'):
+        try:
+            import onnxruntime as ort
+            if os.path.exists(MODEL_PATH):
+                sess_options = ort.SessionOptions()
+                sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+                sess_options.intra_op_num_threads = 1
+                predict_patient_risk_json._onnx_session = ort.InferenceSession(
+                    MODEL_PATH,
+                    sess_options=sess_options,
+                    providers=['CPUExecutionProvider']
+                )
+                # Загружаем feature columns из конфига
+                if os.path.exists(FEATURE_CONFIG_PATH):
+                    with open(FEATURE_CONFIG_PATH, 'r') as f:
+                        config = json.load(f)
+                        predict_patient_risk_json._feature_columns = config['feature_columns']
+                else:
+                    predict_patient_risk_json._feature_columns = [
+                        'age', 'gender', 'systolic_bp', 'diastolic_bp', 'cholesterol',
+                        'bmi', 'diabetes', 'hypertension', 'medication_count',
+                        'length_of_stay', 'discharge_destination'
+                    ]
+            else:
+                predict_patient_risk_json._onnx_session = None
+                predict_patient_risk_json._feature_columns = None
+        except Exception as e:
+            logger.warning(f"Failed to load ONNX model: {e}")
+            predict_patient_risk_json._onnx_session = None
+            predict_patient_risk_json._feature_columns = None
     
     # Lazy init Redis
     if not hasattr(predict_patient_risk_json, '_redis'):
@@ -66,6 +102,15 @@ def predict_patient_risk_json(
     try:
         # 1. Extract features
         feature_start = time.time()
+        
+        # Парсим blood_pressure
+        bp_parts = blood_pressure.split('/')
+        if len(bp_parts) != 2:
+            systolic_bp = 120.0
+            diastolic_bp = 80.0
+        else:
+            systolic_bp = float(bp_parts[0])
+            diastolic_bp = float(bp_parts[1])
         
         # Получение исторических данных из Redis
         r = predict_patient_risk_json._redis
@@ -85,53 +130,65 @@ def predict_patient_risk_json(
         
         feature_time_ms = (time.time() - feature_start) * 1000
         
-        # 2. Prepare features for ML model
-        features = {
-            'patient_id': patient_id,
-            'age': age,
-            'glucose_level': glucose_level,
-            'blood_pressure': blood_pressure,
-            'bmi': bmi,
-            'previous_risk_score': previous_risk_score,
-            'previous_anomaly': previous_anomaly
-        }
+        # 2. Prepare features for ML model (в порядке feature_columns)
+        feature_columns = predict_patient_risk_json._feature_columns
+        if feature_columns:
+            # Создаем фичи в правильном порядке
+            feature_dict = {
+                'age': float(age),
+                'gender': 0,  # По умолчанию, можно добавить в данные
+                'systolic_bp': systolic_bp,
+                'diastolic_bp': diastolic_bp,
+                'cholesterol': 200.0,  # По умолчанию
+                'bmi': float(bmi),
+                'diabetes': 0,  # По умолчанию
+                'hypertension': 1 if systolic_bp > 140 or diastolic_bp > 90 else 0,
+                'medication_count': 0,  # По умолчанию
+                'length_of_stay': 3,  # По умолчанию
+                'discharge_destination': 0  # По умолчанию (Home)
+            }
+            
+            feature_vector = np.array([[
+                feature_dict.get(col, 0.0) for col in feature_columns
+            ]], dtype=np.float32)
+        else:
+            # Fallback если конфиг не загружен
+            feature_vector = np.array([[
+                float(age), 0.0, systolic_bp, diastolic_bp, 200.0,
+                float(bmi), 0.0, 1 if systolic_bp > 140 else 0, 0.0, 3.0, 0.0
+            ]], dtype=np.float32)
         
-        # 3. ML Inference
+        # 3. ML Inference через ONNX
         inference_start = time.time()
         
-        try:
-            # Используем session для connection pooling
-            if not hasattr(predict_patient_risk_json, '_session'):
-                from requests.adapters import HTTPAdapter
-                predict_patient_risk_json._session = requests.Session()
-                adapter = HTTPAdapter(
-                    pool_connections=20,
-                    pool_maxsize=40,
-                    max_retries=0
-                )
-                predict_patient_risk_json._session.mount('http://', adapter)
-            
-            response = predict_patient_risk_json._session.post(
-                MODEL_ENDPOINT,
-                json=features,
-                timeout=(0.005, 0.015),  # 5ms connect, 15ms read
-                headers={
-                    'Connection': 'keep-alive',
-                    'Content-Type': 'application/json'
-                }
-            )
-            
-            if response.status_code == 200:
-                prediction = response.json()
-                risk_score = prediction.get('risk_score', 0.0)
-                anomaly = prediction.get('anomaly', False)
-            else:
+        session = predict_patient_risk_json._onnx_session
+        if session:
+            try:
+                input_name = session.get_inputs()[0].name
+                result = session.run(None, {input_name: feature_vector})
+                
+                # ONNX модель возвращает вероятности для двух классов
+                if len(result[0].shape) == 2 and result[0].shape[1] == 2:
+                    risk_score = float(result[0][0][1])  # Вероятность readmission
+                elif len(result[0].shape) == 2 and result[0].shape[1] == 1:
+                    logit = float(result[0][0][0])
+                    risk_score = float(1.0 / (1.0 + np.exp(-logit)))
+                else:
+                    risk_score = float(result[0][0][0] if result[0][0][0] <= 1.0 else 1.0 / (1.0 + np.exp(-result[0][0][0])))
+            except Exception as e:
+                logger.debug(f"ONNX inference error: {e}")
                 risk_score = 0.0
-                anomaly = False
-        except Exception as e:
-            logger.debug(f"Model inference error: {e}")
+        else:
+            # Fallback если модель не загружена
             risk_score = 0.0
-            anomaly = False
+        
+        # Детекция аномалий
+        anomaly = False
+        if (risk_score > 0.7 or 
+            systolic_bp > 160 or 
+            diastolic_bp > 100 or 
+            bmi > 35):
+            anomaly = True
         
         inference_time_ms = (time.time() - inference_start) * 1000
         
@@ -192,22 +249,53 @@ def main():
     logger.info("Variant: 6 (p99 < 30 ms)")
     logger.info("="*60)
     
-    settings = EnvironmentSettings.in_streaming_mode()
-    t_env = TableEnvironment.create(settings)
+    # Проверка модели
+    import os
+    model_path = "/opt/flink/models/readmission_model.onnx"
+    if os.path.exists(model_path):
+        logger.info(f"ONNX model found: {model_path}")
+    else:
+        logger.warning(f"ONNX model NOT found: {model_path}")
     
-    config = t_env.get_config()
-    config.set("parallelism.default", "8")
-    config.set("pipeline.name", "Patient Readmission Monitoring Pipeline")
+    logger.info("Creating EnvironmentSettings...")
+    try:
+        settings = EnvironmentSettings.in_streaming_mode()
+        logger.info("EnvironmentSettings created")
+        
+        logger.info("Creating TableEnvironment...")
+        t_env = TableEnvironment.create(settings)
+        logger.info("TableEnvironment created successfully")
+    except Exception as e:
+        logger.error(f"Failed to create TableEnvironment: {e}", exc_info=True)
+        raise
     
-    # Настройка checkpointing
-    config.set("execution.checkpointing.interval", "500ms")
-    config.set("execution.checkpointing.mode", "EXACTLY_ONCE")
-    config.set("execution.checkpointing.timeout", "10s")
+    logger.info("Configuring Flink settings...")
+    try:
+        config = t_env.get_config()
+        config.set("parallelism.default", "8")
+        config.set("pipeline.name", "Patient Readmission Monitoring Pipeline")
+        
+        # Настройка checkpointing
+        config.set("execution.checkpointing.interval", "500ms")
+        config.set("execution.checkpointing.mode", "EXACTLY_ONCE")
+        config.set("execution.checkpointing.timeout", "10s")
+        logger.info("Flink settings configured")
+    except Exception as e:
+        logger.error(f"Failed to configure Flink settings: {e}", exc_info=True)
+        raise
     
-    t_env.create_temporary_function("predict_patient_risk_json", predict_patient_risk_json)
+    logger.info("Creating UDF...")
+    try:
+        t_env.create_temporary_function("predict_patient_risk_json", predict_patient_risk_json)
+        logger.info("UDF created successfully")
+    except Exception as e:
+        logger.error(f"Failed to create UDF: {e}", exc_info=True)
+        raise
     
     # Создание таблицы источника из Kafka (ts вместо timestamp)
-    t_env.execute_sql("""
+    logger.info("Creating source table...")
+    try:
+        t_env.execute_sql("""
     CREATE TABLE patient_readmissions (
         patient_id STRING,
         age INT,
@@ -226,9 +314,15 @@ def main():
         'json.ignore-parse-errors' = 'true'
     )
     """)
+        logger.info("Source table created successfully")
+    except Exception as e:
+        logger.error(f"Failed to create source table: {e}", exc_info=True)
+        raise
     
     # Создание таблицы для предсказаний
-    t_env.execute_sql("""
+    logger.info("Creating sink table...")
+    try:
+        t_env.execute_sql("""
     CREATE TABLE patient_predictions (
         prediction_json STRING
     ) WITH (
@@ -238,20 +332,33 @@ def main():
         'format' = 'raw'
     )
     """)
+        logger.info("Sink table created successfully")
+    except Exception as e:
+        logger.error(f"Failed to create sink table: {e}", exc_info=True)
+        raise
     
     logger.info("Submitting ML inference job...")
     
     # Основной поток предсказаний
-    result = t_env.execute_sql("""
+    try:
+        result = t_env.execute_sql("""
     INSERT INTO patient_predictions
     SELECT predict_patient_risk_json(
         patient_id, age, glucose_level, blood_pressure, bmi, ts
     )
     FROM patient_readmissions
     """)
+        logger.info("SQL query submitted successfully")
+    except Exception as e:
+        logger.error(f"Failed to submit SQL query: {e}", exc_info=True)
+        raise
     
     logger.info("JOB RUNNING WITH ML INFERENCE!")
-    result.wait()
+    try:
+        result.wait()
+    except Exception as e:
+        logger.error(f"Job execution failed: {e}", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":

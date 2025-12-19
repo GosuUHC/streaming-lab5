@@ -5,12 +5,8 @@ global:
 scrape_configs:
   - job_name: 'flink'
     static_configs:
-      - targets: ['jobmanager:9250']
+      - targets: ['taskmanager:9250', 'jobmanager:9250']
     scrape_interval: 10s
-    relabel_configs:
-      - source_labels: [__address__]
-        target_label: instance
-        replacement: 'jobmanager'
     
   - job_name: 'model-server'
     static_configs:

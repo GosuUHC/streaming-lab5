@@ -81,6 +81,12 @@ services:
       - "8000:8000"
     depends_on:
       - redis
+    volumes:
+      - models-data:/app/models
+    environment:
+      - ONNXRUNTIME_DISABLE_EXECUTABLE_STACK_CHECK=1
+    security_opt:
+      - seccomp:unconfined
 
   kafka-exporter:
     image: danielqsj/kafka-exporter:latest
@@ -130,6 +136,7 @@ services:
     depends_on:
       - kafka
       - redis
+      - model-server
 
   data-drift-monitor:
     build:
@@ -161,16 +168,18 @@ services:
     environment:
       - FLINK_JOB_MANAGER=jobmanager:8081
       - KAFKA_BOOTSTRAP=kafka:9092
-      - MODEL_SERVER=http://model-server:8000
       - REDIS_HOST=redis
+    volumes:
+      - models-data:/opt/flink/models:ro
     command: >
       sh -c "
       echo 'Waiting for Flink JobManager to be ready...' &&
       until nc -z jobmanager 8081; do sleep 2; done &&
       echo 'Waiting for Kafka to be ready...' &&
       until nc -z kafka 9092; do sleep 2; done &&
-      echo 'Waiting for Model Server to be ready...' &&
-      until nc -z model-server 8000; do sleep 2; done &&
+      echo 'Waiting for model files...' &&
+      until [ -f /opt/flink/models/readmission_model.onnx ]; do sleep 2; done &&
+      echo 'Model files ready!' &&
       echo 'Starting Flink Job...' &&
       python3 /opt/flink/usrlib/patient_monitoring.py
       "
@@ -179,3 +188,4 @@ services:
 volumes:
   flink-checkpoints:
   flink-savepoints:
+  models-data:

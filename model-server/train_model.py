@@ -1,10 +1,12 @@
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report
-import joblib
+import json
 import logging
+from skl2onnx import convert_sklearn
+from skl2onnx.common.data_types import FloatTensorType
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -108,13 +110,12 @@ def train_model(df):
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    # Обучаем легковесную модель
-    model = RandomForestClassifier(
-        n_estimators=50,  # Меньше деревьев для скорости
-        max_depth=10,
-        min_samples_split=20,
+    # Обучаем быструю модель - LogisticRegression для низкой задержки
+    model = LogisticRegression(
+        max_iter=1000,
         random_state=42,
-        n_jobs=-1
+        n_jobs=-1,
+        solver='lbfgs'  # Быстрый solver для небольших датасетов
     )
 
     model.fit(X_train, y_train)
@@ -127,31 +128,73 @@ def train_model(df):
     logger.info("\nClassification Report:")
     logger.info(f"\n{classification_report(y_test, y_pred)}")
 
-    # Важность признаков
-    feature_importance = pd.DataFrame({
+    # Для LogisticRegression используем коэффициенты вместо feature_importances_
+    feature_coefficients = pd.DataFrame({
         'feature': feature_columns,
-        'importance': model.feature_importances_
-    }).sort_values('importance', ascending=False)
+        'coefficient': model.coef_[0]
+    }).sort_values('coefficient', key=abs, ascending=False)
 
-    logger.info("\nFeature Importance:")
-    logger.info(feature_importance)
+    logger.info("\nFeature Coefficients (absolute values):")
+    logger.info(feature_coefficients)
 
     return model, feature_columns
 
 
 def save_model(model, feature_columns):
-    """Сохранение модели и метаданных"""
-    joblib.dump(model, 'readmission_model.joblib')
+    """Сохранение модели в ONNX формат и метаданных в JSON"""
+    import os
+    
+    # Создаем директорию для моделей (будет монтироваться как volume)
+    models_dir = "/app/models"
+    os.makedirs(models_dir, exist_ok=True)
+    
+    # Экспортируем модель в ONNX формат для быстрого инференса
+    try:
+        # Определяем тип входных данных для ONNX
+        initial_type = [('float_input', FloatTensorType([None, len(feature_columns)]))]
+        
+        # Конвертируем модель в ONNX
+        onnx_model = convert_sklearn(
+            model,
+            initial_types=initial_type,
+            target_opset=13  # Совместимость с onnxruntime
+        )
+        
+        # Сохраняем ONNX модель в директорию models
+        onnx_path = os.path.join(models_dir, "readmission_model.onnx")
+        with open(onnx_path, "wb") as f:
+            f.write(onnx_model.SerializeToString())
+        
+        logger.info(f"ONNX model saved successfully: {onnx_path}")
+        
+        # Также сохраняем в корневую директорию для совместимости с app.py
+        with open("readmission_model.onnx", "wb") as f:
+            f.write(onnx_model.SerializeToString())
+        logger.info("ONNX model also saved to: readmission_model.onnx")
+    except Exception as e:
+        logger.error(f"Error converting model to ONNX: {e}")
+        raise
 
-    # Сохраняем информацию о фичах
+    # Сохраняем информацию о фичах в JSON формате
     model_metadata = {
         'feature_columns': feature_columns,
-        'model_type': 'RandomForest',
-        'version': '1.0'
+        'model_type': 'LogisticRegression',
+        'version': '1.0',
+        'onnx_model_path': 'readmission_model.onnx',
+        'n_features': len(feature_columns)
     }
 
-    joblib.dump(model_metadata, 'model_metadata.joblib')
-    logger.info("Model and metadata saved successfully")
+    # Сохраняем метаданные в JSON в директорию models
+    metadata_path = os.path.join(models_dir, "model_metadata.json")
+    with open(metadata_path, 'w', encoding='utf-8') as f:
+        json.dump(model_metadata, f, indent=2, ensure_ascii=False)
+    logger.info(f"Model metadata saved to: {metadata_path}")
+    
+    # Также сохраняем в корневую директорию для совместимости с app.py
+    with open('model_metadata.json', 'w', encoding='utf-8') as f:
+        json.dump(model_metadata, f, indent=2, ensure_ascii=False)
+    
+    logger.info("Model and metadata saved successfully (ONNX + JSON)")
 
 
 if __name__ == '__main__':

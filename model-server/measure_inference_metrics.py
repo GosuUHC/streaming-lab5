@@ -1,6 +1,6 @@
 """
 Скрипт для измерения метрик инференса ML модели
-Измеряет latency (p50, p95, p99), throughput и error rate
+Измеряет latency (p50, p95, p99) и error rate
 """
 import requests
 import time
@@ -40,7 +40,7 @@ def measure_metrics(model_endpoint: str = "http://localhost:8000/predict",
         num_requests: Количество запросов для тестирования
     
     Returns:
-        Словарь с метриками: p50, p95, p99, throughput, error_rate
+        Словарь с метриками: p50, p95, p99, error_rate
     """
     latencies = []
     errors = []
@@ -110,7 +110,6 @@ def measure_metrics(model_endpoint: str = "http://localhost:8000/predict",
     else:
         p50 = p95 = p99 = avg_latency = min_latency = max_latency = 0
     
-    throughput = len(latencies) / total_time if total_time > 0 else 0
     error_rate = error_count / num_requests if num_requests > 0 else 0
     
     metrics = {
@@ -120,7 +119,6 @@ def measure_metrics(model_endpoint: str = "http://localhost:8000/predict",
         'avg_latency_ms': round(avg_latency, 2),
         'min_latency_ms': round(min_latency, 2),
         'max_latency_ms': round(max_latency, 2),
-        'throughput_req_per_sec': round(throughput, 2),
         'error_rate': round(error_rate, 4),
         'error_count': error_count,
         'successful_requests': len(latencies),
@@ -143,9 +141,6 @@ def print_metrics_report(metrics: Dict, errors: List):
     print(f"  Avg:  {metrics['avg_latency_ms']:.2f} ms")
     print(f"  Min:  {metrics['min_latency_ms']:.2f} ms")
     print(f"  Max:  {metrics['max_latency_ms']:.2f} ms")
-    
-    print(f"\n⚡ Throughput:")
-    print(f"  {metrics['throughput_req_per_sec']:.2f} requests/second")
     
     print(f"\n❌ Error Metrics:")
     print(f"  Error Rate: {metrics['error_rate']*100:.2f}%")
